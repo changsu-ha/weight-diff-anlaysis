@@ -1,6 +1,6 @@
 from pathlib import Path
 
-import torch
+import pytest
 
 from scripts.compare_pi05_weights import (
     TensorStore,
@@ -8,6 +8,8 @@ from scripts.compare_pi05_weights import (
     normalize_param_name,
     resolve_weight_file,
 )
+
+torch = pytest.importorskip("torch")
 
 
 def test_resolve_weight_file_priority(tmp_path: Path):

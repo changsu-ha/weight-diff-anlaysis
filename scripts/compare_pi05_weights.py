@@ -3,9 +3,15 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, Mapping
+from typing import TYPE_CHECKING, Dict, Iterator, Mapping
 
-import torch
+if TYPE_CHECKING:
+    import torch
+else:
+    try:
+        import torch
+    except ImportError:  # pragma: no cover - exercised in environments without torch
+        torch = None
 
 PREFERRED_WEIGHT_FILENAMES = (
     "model.safetensors",
@@ -83,7 +89,7 @@ def _unwrap_checkpoint_dict(payload: object) -> Mapping[str, torch.Tensor]:
 
     tensor_map: Dict[str, torch.Tensor] = {}
     for key, value in current.items():
-        if isinstance(value, torch.Tensor):
+        if torch is not None and isinstance(value, torch.Tensor):
             tensor_map[str(key)] = value
     return tensor_map
 
@@ -108,10 +114,13 @@ class TensorStore:
     """Unified checkpoint reader for safetensors and torch serialized checkpoints."""
 
     def __init__(self, path: Path | str):
+        if torch is None:
+            raise ImportError("TensorStore requires PyTorch. Install with: pip install torch")
         self.path = resolve_weight_file(path)
         self.suffix = self.path.suffix.lower()
         self._is_safetensors = self.suffix == ".safetensors"
         self._safe_file = None
+        self._safe_key_map: Dict[str, str] | None = None
         self._state_dict: Dict[str, torch.Tensor] | None = None
 
     def _open_safetensors(self):
@@ -129,6 +138,23 @@ class TensorStore:
         self._safe_file = safe_open(str(self.path), framework="pt", device="cpu")
         return self._safe_file
 
+    def _get_safetensors_key_map(self) -> Dict[str, str]:
+        if self._safe_key_map is not None:
+            return self._safe_key_map
+
+        sf = self._open_safetensors()
+        normalized_map: Dict[str, str] = {}
+        for src_key in sf.keys():
+            normalized_key = normalize_param_name(src_key)
+            if normalized_key in normalized_map and normalized_map[normalized_key] != src_key:
+                raise ValueError(
+                    f"Normalized key collision in safetensors file {self.path}: "
+                    f"{normalized_map[normalized_key]!r} and {src_key!r} both map to {normalized_key!r}"
+                )
+            normalized_map[normalized_key] = src_key
+        self._safe_key_map = normalized_map
+        return self._safe_key_map
+
     def _open_torch(self) -> Dict[str, torch.Tensor]:
         if self._state_dict is not None:
             return self._state_dict
@@ -138,29 +164,30 @@ class TensorStore:
 
         normalized: Dict[str, torch.Tensor] = {}
         for key, tensor in raw.items():
-            normalized[normalize_param_name(key)] = tensor
+            normalized_key = normalize_param_name(key)
+            if normalized_key in normalized and normalized[normalized_key] is not tensor:
+                raise ValueError(
+                    f"Normalized key collision in torch checkpoint {self.path}: "
+                    f"multiple keys map to {normalized_key!r}"
+                )
+            normalized[normalized_key] = tensor
 
         self._state_dict = normalized
         return self._state_dict
 
     def keys(self) -> set[str]:
         if self._is_safetensors:
-            sf = self._open_safetensors()
-            return {normalize_param_name(k) for k in sf.keys()}
+            return set(self._get_safetensors_key_map().keys())
         return set(self._open_torch().keys())
 
     def get(self, key: str) -> torch.Tensor:
         normalized_key = normalize_param_name(key)
         if self._is_safetensors:
             sf = self._open_safetensors()
-            if normalized_key in sf.keys():
-                return sf.get_tensor(normalized_key)
-
-            # fallback when source keys are not normalized
-            for src_key in sf.keys():
-                if normalize_param_name(src_key) == normalized_key:
-                    return sf.get_tensor(src_key)
-            raise KeyError(normalized_key)
+            key_map = self._get_safetensors_key_map()
+            if normalized_key not in key_map:
+                raise KeyError(normalized_key)
+            return sf.get_tensor(key_map[normalized_key])
 
         state = self._open_torch()
         if normalized_key not in state:
