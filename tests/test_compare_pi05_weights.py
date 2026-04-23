@@ -4,6 +4,7 @@ import pytest
 
 from scripts.compare_pi05_weights import (
     RawStats,
+    compare_and_write_outputs,
     compute_hierarchical_stats,
     compute_raw_stats,
     component_of,
@@ -89,8 +90,8 @@ def test_compute_and_finalize_stats_chunked():
 
 def test_hierarchical_stats_reuse_pipeline():
     pairs = {
-        "encoder.layer1.weight": (torch.tensor([1.0, -1.0]), torch.tensor([1.0, 1.0])),
-        "encoder.layer1.bias": (torch.tensor([0.5]), torch.tensor([0.0])),
+        "encoder.layer.1.weight": (torch.tensor([1.0, -1.0]), torch.tensor([1.0, 1.0])),
+        "encoder.layer.1.bias": (torch.tensor([0.5]), torch.tensor([0.0])),
         "head.weight": (torch.tensor([2.0]), torch.tensor([1.0])),
     }
 
@@ -98,10 +99,10 @@ def test_hierarchical_stats_reuse_pipeline():
 
     assert set(summary.keys()) == {"global", "component", "layer", "param_type", "parameter"}
     assert "__all__" in summary["global"]
-    assert "encoder" in summary["component"]
-    assert "encoder.layer1" in summary["layer"]
-    assert "weight" in summary["param_type"]
-    assert "encoder.layer1.weight" in summary["parameter"]
+    assert "other" in summary["component"]
+    assert "other|other.block_01" in summary["layer"]
+    assert "other|other" in summary["param_type"]
+    assert "encoder.layer.1.weight" in summary["parameter"]
 
     global_stats = summary["global"]["__all__"]
     assert global_stats.n == 4
@@ -116,10 +117,10 @@ def test_key_classification_helpers():
     assert layer_id_of("vlm.embed_tokens.weight", "vlm_backbone") == "vlm.token_embedding"
     assert layer_id_of("vlm.lm_head.weight", "vlm_backbone") == "vlm.lm_head"
     assert layer_id_of("action_expert.action_projection.weight", "action_expert") == "action_expert.projections"
-    assert param_type_of("vlm.layers.0.self_attn.q_proj.weight") == "attention"
-    assert param_type_of("vit.blocks.0.mlp.fc1.weight") == "mlp"
-    assert param_type_of("vlm.layers.0.input_layernorm.weight") == "norm"
-    assert param_type_of("vlm.embed_tokens.weight") == "embedding"
+    assert param_type_of("vlm.layers.0.self_attn.q_proj.weight") == "attention.q_proj"
+    assert param_type_of("vit.blocks.0.mlp.fc1.weight") == "mlp.other"
+    assert param_type_of("vlm.layers.0.input_layernorm.weight") == "normalization"
+    assert param_type_of("vlm.embed_tokens.weight") == "token_embedding"
     assert param_type_of("action_expert.action_projection.weight") == "action_projection"
 
 
@@ -141,4 +142,87 @@ def test_component_map_and_csv_output(tmp_path: Path):
     )
     csv_text = out_csv.read_text(encoding="utf-8")
     assert "name,component,layer_id,param_type,shape,num_params" in csv_text
-    assert "my_custom.blocks.0.attn.q_proj.weight,vit,vit.block_00,attention,\"(2, 3)\",6" in csv_text
+    assert "my_custom.blocks.0.attn.q_proj.weight,vit,vit.block_00,attention.q_proj,\"(2, 3)\",6" in csv_text
+
+
+def test_full_output_artifacts(tmp_path: Path):
+    pytest.importorskip("matplotlib")
+    a_path = tmp_path / "a.pt"
+    b_path = tmp_path / "b.pt"
+    out = tmp_path / "out"
+
+    torch.save(
+        {
+            "vit.blocks.0.attn.q_proj.weight": torch.ones(2, 2),
+            "vlm.layers.0.mlp.up_proj.weight": torch.ones(2, 2),
+            "action_expert.blocks.0.weight": torch.ones(2),
+            "only_a": torch.ones(1),
+            "shape_x": torch.ones(2, 3),
+        },
+        a_path,
+    )
+    torch.save(
+        {
+            "vit.blocks.0.attn.q_proj.weight": torch.ones(2, 2) * 2,
+            "vlm.layers.0.mlp.up_proj.weight": torch.ones(2, 2) * 0.5,
+            "action_expert.blocks.0.weight": torch.ones(2) * -1,
+            "only_b": torch.ones(1),
+            "shape_x": torch.ones(3, 2),
+        },
+        b_path,
+    )
+
+    class A:
+        pass
+
+    ns = A()
+    ns.a = a_path
+    ns.b = b_path
+    ns.out = out
+    ns.component_map_json = None
+    ns.include_other = True
+    ns.exclude_buffers = True
+    ns.top_k = 10
+    ns.histogram_sample_size = 10
+    ns.scatter_sample_size = 10
+    ns.chunk_size = 2
+    ns.fail_on_shape_mismatch = False
+    ns.verbose = False
+    ns.key_classification_csv = Path("unused.csv")
+
+    compare_and_write_outputs(ns)
+
+    required = [
+        "component_summary.csv",
+        "layer_summary.csv",
+        "parameter_type_summary.csv",
+        "per_parameter.csv",
+        "shape_mismatches.csv",
+        "only_in_a.csv",
+        "only_in_b.csv",
+        "summary.json",
+        "report.md",
+        "component_relative_diff.png",
+        "component_cosine_similarity.png",
+        "component_mean_abs_diff.png",
+        "layer_relative_diff_vit.png",
+        "layer_relative_diff_vlm_backbone.png",
+        "layer_relative_diff_action_expert.png",
+        "layer_cosine_similarity_vit.png",
+        "layer_cosine_similarity_vlm_backbone.png",
+        "layer_cosine_similarity_action_expert.png",
+        "parameter_type_relative_diff.png",
+        "top_changed_parameters.png",
+        "weight_diff_histogram_global.png",
+        "weight_diff_histogram_vit.png",
+        "weight_diff_histogram_vlm_backbone.png",
+        "weight_diff_histogram_action_expert.png",
+        "weight_scatter_global.png",
+    ]
+    for name in required:
+        assert (out / name).exists(), name
+
+    payload = (out / "summary.json").read_text(encoding="utf-8")
+    assert '"num_shape_mismatches": 1' in payload
+    assert '"num_only_in_a": 1' in payload
+    assert '"num_only_in_b": 1' in payload
