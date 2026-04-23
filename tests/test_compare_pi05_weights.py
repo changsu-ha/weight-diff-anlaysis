@@ -68,6 +68,35 @@ def test_torch_wrapper_and_indexing(tmp_path: Path):
     assert "counter" not in index.comparable
 
 
+def test_same_structure_without_shape_mismatch(tmp_path: Path):
+    ckpt_a = {
+        "state_dict": {
+            "module.vit.blocks.0.attn.q_proj.weight": torch.ones(2, 2),
+            "module.vit.blocks.0.attn.q_proj.bias": torch.zeros(2),
+        }
+    }
+    ckpt_b = {
+        "model": {
+            "_orig_mod.vit.blocks.0.attn.q_proj.weight": torch.ones(2, 2) * 1.5,
+            "_orig_mod.vit.blocks.0.attn.q_proj.bias": torch.ones(2),
+        }
+    }
+
+    path_a = tmp_path / "same_a.pt"
+    path_b = tmp_path / "same_b.pt"
+    torch.save(ckpt_a, path_a)
+    torch.save(ckpt_b, path_b)
+
+    index = index_checkpoint_keys(TensorStore(path_a), TensorStore(path_b))
+    assert index.shape_mismatch == set()
+    assert index.only_in_a == set()
+    assert index.only_in_b == set()
+    assert index.comparable == {
+        "vit.blocks.0.attn.q_proj.weight",
+        "vit.blocks.0.attn.q_proj.bias",
+    }
+
+
 def test_compute_and_finalize_stats_chunked():
     a = torch.tensor([1.0, -2.0, 0.0, float("nan"), float("inf")])
     b = torch.tensor([-1.0, -1.0, 0.0, 0.0, float("inf")])
@@ -122,6 +151,35 @@ def test_key_classification_helpers():
     assert param_type_of("vlm.layers.0.input_layernorm.weight") == "normalization"
     assert param_type_of("vlm.embed_tokens.weight") == "token_embedding"
     assert param_type_of("action_expert.action_projection.weight") == "action_projection"
+
+
+def test_openpi_representative_key_classification(tmp_path: Path):
+    ckpt_path = tmp_path / "openpi.pt"
+    torch.save(
+        {
+            "vit.blocks.0.attn.q_proj.weight": torch.ones(2, 2),
+            "vlm.layers.3.self_attn.k_proj.weight": torch.ones(2, 2),
+            "action_expert.blocks.7.mlp.fc1.weight": torch.ones(2, 2),
+        },
+        ckpt_path,
+    )
+    store = TensorStore(ckpt_path)
+
+    out_csv = tmp_path / "openpi_key_classification.csv"
+    write_key_classification_csv(
+        store=store,
+        keys={
+            "vit.blocks.0.attn.q_proj.weight",
+            "vlm.layers.3.self_attn.k_proj.weight",
+            "action_expert.blocks.7.mlp.fc1.weight",
+        },
+        output_path=out_csv,
+        component_map=None,
+    )
+    rows = out_csv.read_text(encoding="utf-8")
+    assert "vit.blocks.0.attn.q_proj.weight,vit,vit.block_00,attention.q_proj" in rows
+    assert "vlm.layers.3.self_attn.k_proj.weight,vlm_backbone,vlm.block_03,attention.k_proj" in rows
+    assert "action_expert.blocks.7.mlp.fc1.weight,action_expert,action_expert.block_07,mlp.fc1" in rows
 
 
 def test_component_map_and_csv_output(tmp_path: Path):
