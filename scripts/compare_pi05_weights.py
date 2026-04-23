@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import csv
 from dataclasses import dataclass
+import json
 from pathlib import Path
+import re
 from typing import TYPE_CHECKING, Dict, Iterator, Mapping
 
 if TYPE_CHECKING:
@@ -387,6 +390,113 @@ def parameter_group_keys(param_name: str) -> dict[str, str]:
     }
 
 
+def load_component_map(path: Path | None) -> dict[str, str]:
+    """Load optional component override map from JSON.
+
+    The JSON must be an object of string prefix -> component name.
+    """
+    if path is None:
+        return {}
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("component map json must be an object: {\"prefix\": \"component\"}")
+    mapping: dict[str, str] = {}
+    for key, value in payload.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            raise ValueError("component map json entries must be string->string")
+        mapping[key] = value
+    return mapping
+
+
+def component_of(key: str, component_map: Mapping[str, str] | None = None) -> str:
+    """Classify a parameter key into action_expert/vit/vlm_backbone/other."""
+    if component_map:
+        for prefix, component in sorted(component_map.items(), key=lambda kv: len(kv[0]), reverse=True):
+            if key == prefix or key.startswith(f"{prefix}."):
+                return component
+
+    lowered = key.lower()
+    if "action_expert" in lowered or lowered.startswith("action_expert."):
+        return "action_expert"
+    if lowered.startswith("vit.") or ".vit." in lowered:
+        return "vit"
+    if lowered.startswith("vlm.") or "vlm_backbone" in lowered or lowered.startswith("llm."):
+        return "vlm_backbone"
+    return "other"
+
+
+def layer_id_of(key: str, component: str) -> str:
+    """Return a normalized layer id including block indices and special cases."""
+    prefix = {"vit": "vit", "vlm_backbone": "vlm", "action_expert": "action_expert"}.get(
+        component, "other"
+    )
+    lowered = key.lower()
+
+    embedding_tokens = ("token_embedding", "embed_tokens", "word_embeddings", "tok_embeddings", "wte")
+    if any(token in lowered for token in embedding_tokens):
+        return f"{prefix}.token_embedding"
+    if "lm_head" in lowered:
+        return f"{prefix}.lm_head"
+    if any(token in lowered for token in ("projection", "projections", "projector", "_proj", ".proj")):
+        return f"{prefix}.projections"
+
+    block_match = re.search(r"(?:^|\.)(?:blocks?|layers?|block|layer)\.(\d+)(?:\.|$)", lowered)
+    if block_match:
+        return f"{prefix}.block_{int(block_match.group(1)):02d}"
+    return f"{prefix}.global"
+
+
+def param_type_of(key: str) -> str:
+    """Classify a parameter key by functional type."""
+    lowered = key.lower()
+    embedding_tokens = ("token_embedding", "embed_tokens", "word_embeddings", "tok_embeddings", "wte")
+
+    if "action_projection" in lowered or ("action" in lowered and "proj" in lowered):
+        return "action_projection"
+    if any(token in lowered for token in embedding_tokens):
+        return "embedding"
+    if "attn" in lowered or "attention" in lowered:
+        return "attention"
+    if any(token in lowered for token in ("mlp", "ffn", "feed_forward", "gate_proj", "up_proj", "down_proj")):
+        return "mlp"
+    if any(token in lowered for token in ("norm", "layernorm", "rmsnorm", ".ln", "ln_")):
+        return "norm"
+    if "bias" in lowered:
+        return "bias"
+    if "weight" in lowered:
+        return "weight"
+    return "other"
+
+
+def write_key_classification_csv(
+    store: TensorStore,
+    keys: set[str],
+    output_path: Path,
+    component_map: Mapping[str, str] | None = None,
+) -> None:
+    """Write per-key classification metadata for comparable parameters."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8", newline="") as fp:
+        writer = csv.DictWriter(
+            fp,
+            fieldnames=["name", "component", "layer_id", "param_type", "shape", "num_params"],
+        )
+        writer.writeheader()
+        for key in sorted(keys):
+            tensor = store.get(key)
+            component = component_of(key, component_map=component_map)
+            writer.writerow(
+                {
+                    "name": key,
+                    "component": component,
+                    "layer_id": layer_id_of(key, component),
+                    "param_type": param_type_of(key),
+                    "shape": str(tuple(tensor.shape)),
+                    "num_params": int(tensor.numel()),
+                }
+            )
+
+
 def compute_hierarchical_stats(
     pairs: Mapping[str, tuple[torch.Tensor, torch.Tensor]], chunk_size: int = 1_000_000
 ) -> dict[str, dict[str, FinalizedStats]]:
@@ -418,6 +528,18 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Compare OpenPI checkpoints.")
     parser.add_argument("--a", type=Path, required=True, help="Checkpoint A path or directory")
     parser.add_argument("--b", type=Path, required=True, help="Checkpoint B path or directory")
+    parser.add_argument(
+        "--component-map-json",
+        type=Path,
+        default=None,
+        help="Optional JSON file for component override mapping (prefix -> component).",
+    )
+    parser.add_argument(
+        "--key-classification-csv",
+        type=Path,
+        default=Path("key_classification.csv"),
+        help="Output CSV path for per-key classification metadata.",
+    )
     return parser.parse_args()
 
 
@@ -426,6 +548,13 @@ if __name__ == "__main__":
     store_a = TensorStore(args.a)
     store_b = TensorStore(args.b)
     idx = index_checkpoint_keys(store_a, store_b)
+    component_map = load_component_map(args.component_map_json)
+    write_key_classification_csv(
+        store=store_a,
+        keys=idx.comparable,
+        output_path=args.key_classification_csv,
+        component_map=component_map,
+    )
     print(
         f"common={len(idx.common_keys)} only_in_a={len(idx.only_in_a)} only_in_b={len(idx.only_in_b)} "
         f"shape_mismatch={len(idx.shape_mismatch)} comparable={len(idx.comparable)}"

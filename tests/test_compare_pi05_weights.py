@@ -6,11 +6,16 @@ from scripts.compare_pi05_weights import (
     RawStats,
     compute_hierarchical_stats,
     compute_raw_stats,
+    component_of,
     finalize_stats,
+    layer_id_of,
+    load_component_map,
+    param_type_of,
     TensorStore,
     index_checkpoint_keys,
     normalize_param_name,
     resolve_weight_file,
+    write_key_classification_csv,
 )
 
 torch = pytest.importorskip("torch")
@@ -101,3 +106,39 @@ def test_hierarchical_stats_reuse_pipeline():
     global_stats = summary["global"]["__all__"]
     assert global_stats.n == 4
     assert isinstance(global_stats, type(finalize_stats(RawStats())))
+
+
+def test_key_classification_helpers():
+    assert component_of("action_expert.blocks.3.attn.q_proj.weight") == "action_expert"
+    assert component_of("vit.blocks.1.mlp.fc1.weight") == "vit"
+    assert component_of("vlm.layers.2.self_attn.q_proj.weight") == "vlm_backbone"
+    assert layer_id_of("vit.blocks.12.attn.q_proj.weight", "vit") == "vit.block_12"
+    assert layer_id_of("vlm.embed_tokens.weight", "vlm_backbone") == "vlm.token_embedding"
+    assert layer_id_of("vlm.lm_head.weight", "vlm_backbone") == "vlm.lm_head"
+    assert layer_id_of("action_expert.action_projection.weight", "action_expert") == "action_expert.projections"
+    assert param_type_of("vlm.layers.0.self_attn.q_proj.weight") == "attention"
+    assert param_type_of("vit.blocks.0.mlp.fc1.weight") == "mlp"
+    assert param_type_of("vlm.layers.0.input_layernorm.weight") == "norm"
+    assert param_type_of("vlm.embed_tokens.weight") == "embedding"
+    assert param_type_of("action_expert.action_projection.weight") == "action_projection"
+
+
+def test_component_map_and_csv_output(tmp_path: Path):
+    map_path = tmp_path / "component_map.json"
+    map_path.write_text('{"my_custom":"vit"}', encoding="utf-8")
+    assert load_component_map(map_path) == {"my_custom": "vit"}
+
+    ckpt_path = tmp_path / "a.pt"
+    torch.save({"my_custom.blocks.0.attn.q_proj.weight": torch.ones(2, 3)}, ckpt_path)
+    store = TensorStore(ckpt_path)
+
+    out_csv = tmp_path / "key_classification.csv"
+    write_key_classification_csv(
+        store=store,
+        keys={"my_custom.blocks.0.attn.q_proj.weight"},
+        output_path=out_csv,
+        component_map={"my_custom": "vit"},
+    )
+    csv_text = out_csv.read_text(encoding="utf-8")
+    assert "name,component,layer_id,param_type,shape,num_params" in csv_text
+    assert "my_custom.blocks.0.attn.q_proj.weight,vit,vit.block_00,attention,\"(2, 3)\",6" in csv_text
