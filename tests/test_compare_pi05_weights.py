@@ -3,6 +3,10 @@ from pathlib import Path
 import pytest
 
 from scripts.compare_pi05_weights import (
+    RawStats,
+    compute_hierarchical_stats,
+    compute_raw_stats,
+    finalize_stats,
     TensorStore,
     index_checkpoint_keys,
     normalize_param_name,
@@ -56,3 +60,44 @@ def test_torch_wrapper_and_indexing(tmp_path: Path):
     assert "mismatch" in index.shape_mismatch
     assert "layer.weight" in index.comparable
     assert "counter" not in index.comparable
+
+
+def test_compute_and_finalize_stats_chunked():
+    a = torch.tensor([1.0, -2.0, 0.0, float("nan"), float("inf")])
+    b = torch.tensor([-1.0, -1.0, 0.0, 0.0, float("inf")])
+
+    raw = compute_raw_stats(a, b, chunk_size=2)
+
+    assert raw.n == 5
+    assert raw.nan_count_a == 1
+    assert raw.nan_count_b == 0
+    assert raw.inf_count_a == 1
+    assert raw.inf_count_b == 1
+    assert raw.sign_flip_count == 1
+
+    final = finalize_stats(raw)
+    assert final.n == 5
+    assert final.max_abs_diff == 2.0
+    assert final.mean_abs_diff == pytest.approx(3.0 / 5.0)
+    assert final.sign_flip_ratio == pytest.approx(1.0 / 5.0)
+
+
+def test_hierarchical_stats_reuse_pipeline():
+    pairs = {
+        "encoder.layer1.weight": (torch.tensor([1.0, -1.0]), torch.tensor([1.0, 1.0])),
+        "encoder.layer1.bias": (torch.tensor([0.5]), torch.tensor([0.0])),
+        "head.weight": (torch.tensor([2.0]), torch.tensor([1.0])),
+    }
+
+    summary = compute_hierarchical_stats(pairs, chunk_size=1)
+
+    assert set(summary.keys()) == {"global", "component", "layer", "param_type", "parameter"}
+    assert "__all__" in summary["global"]
+    assert "encoder" in summary["component"]
+    assert "encoder.layer1" in summary["layer"]
+    assert "weight" in summary["param_type"]
+    assert "encoder.layer1.weight" in summary["parameter"]
+
+    global_stats = summary["global"]["__all__"]
+    assert global_stats.n == 4
+    assert isinstance(global_stats, type(finalize_stats(RawStats())))

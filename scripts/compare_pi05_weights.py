@@ -32,6 +32,60 @@ class KeyIndex:
     comparable: set[str]
 
 
+@dataclass
+class RawStats:
+    n: int = 0
+    sum_a2: float = 0.0
+    sum_b2: float = 0.0
+    sum_diff2: float = 0.0
+    dot: float = 0.0
+    sum_abs_diff: float = 0.0
+    max_abs_diff: float = 0.0
+    sign_flip_count: int = 0
+    nan_count_a: int = 0
+    nan_count_b: int = 0
+    nan_count_diff: int = 0
+    inf_count_a: int = 0
+    inf_count_b: int = 0
+    inf_count_diff: int = 0
+
+    def merge(self, other: "RawStats") -> None:
+        self.n += other.n
+        self.sum_a2 += other.sum_a2
+        self.sum_b2 += other.sum_b2
+        self.sum_diff2 += other.sum_diff2
+        self.dot += other.dot
+        self.sum_abs_diff += other.sum_abs_diff
+        self.max_abs_diff = max(self.max_abs_diff, other.max_abs_diff)
+        self.sign_flip_count += other.sign_flip_count
+        self.nan_count_a += other.nan_count_a
+        self.nan_count_b += other.nan_count_b
+        self.nan_count_diff += other.nan_count_diff
+        self.inf_count_a += other.inf_count_a
+        self.inf_count_b += other.inf_count_b
+        self.inf_count_diff += other.inf_count_diff
+
+
+@dataclass(frozen=True)
+class FinalizedStats:
+    n: int
+    norm_a: float
+    norm_b: float
+    diff_norm: float
+    relative_diff: float
+    cosine_similarity: float
+    mean_abs_diff: float
+    max_abs_diff: float
+    sign_flip_ratio: float
+    sign_flip_count: int
+    nan_count_a: int
+    nan_count_b: int
+    nan_count_diff: int
+    inf_count_a: int
+    inf_count_b: int
+    inf_count_diff: int
+
+
 
 def resolve_weight_file(path: Path | str) -> Path:
     """Resolve a weight file from a direct file path or a directory.
@@ -233,6 +287,130 @@ def index_checkpoint_keys(store_a: TensorStore, store_b: TensorStore) -> KeyInde
         shape_mismatch=shape_mismatch,
         comparable=comparable,
     )
+
+
+def compute_raw_stats(a: torch.Tensor, b: torch.Tensor, chunk_size: int = 1_000_000) -> RawStats:
+    """Compute chunked accumulators from two tensors of identical shape."""
+    if a.shape != b.shape:
+        raise ValueError(f"Shape mismatch: {tuple(a.shape)} != {tuple(b.shape)}")
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be a positive integer")
+
+    a_flat = a.detach().reshape(-1).to(dtype=torch.float64, device="cpu")
+    b_flat = b.detach().reshape(-1).to(dtype=torch.float64, device="cpu")
+
+    out = RawStats()
+    total = int(a_flat.numel())
+
+    for start in range(0, total, chunk_size):
+        end = min(total, start + chunk_size)
+        ac = a_flat[start:end]
+        bc = b_flat[start:end]
+        diff = ac - bc
+
+        out.n += int(ac.numel())
+        out.nan_count_a += int(torch.isnan(ac).sum().item())
+        out.nan_count_b += int(torch.isnan(bc).sum().item())
+        out.nan_count_diff += int(torch.isnan(diff).sum().item())
+        out.inf_count_a += int(torch.isinf(ac).sum().item())
+        out.inf_count_b += int(torch.isinf(bc).sum().item())
+        out.inf_count_diff += int(torch.isinf(diff).sum().item())
+
+        finite_mask = torch.isfinite(ac) & torch.isfinite(bc) & torch.isfinite(diff)
+        if not bool(finite_mask.any()):
+            continue
+
+        ac_f = ac[finite_mask]
+        bc_f = bc[finite_mask]
+        diff_f = diff[finite_mask]
+
+        out.sum_a2 += float((ac_f * ac_f).sum().item())
+        out.sum_b2 += float((bc_f * bc_f).sum().item())
+        out.sum_diff2 += float((diff_f * diff_f).sum().item())
+        out.dot += float((ac_f * bc_f).sum().item())
+        out.sum_abs_diff += float(diff_f.abs().sum().item())
+
+        chunk_max = float(diff_f.abs().max().item())
+        out.max_abs_diff = max(out.max_abs_diff, chunk_max)
+
+        # Sign flip: strict opposite sign only (0 is neutral and excluded).
+        flips = ((ac_f > 0) & (bc_f < 0)) | ((ac_f < 0) & (bc_f > 0))
+        out.sign_flip_count += int(flips.sum().item())
+
+    return out
+
+
+def finalize_stats(stats: RawStats, eps: float = 1e-12) -> FinalizedStats:
+    """Convert raw accumulators into normalized metrics."""
+    norm_a = float(stats.sum_a2 ** 0.5)
+    norm_b = float(stats.sum_b2 ** 0.5)
+    diff_norm = float(stats.sum_diff2 ** 0.5)
+
+    relative_diff = diff_norm / max(norm_a, eps)
+    cosine_similarity = stats.dot / max(norm_a * norm_b, eps)
+    mean_abs_diff = stats.sum_abs_diff / max(stats.n, 1)
+    sign_flip_ratio = stats.sign_flip_count / max(stats.n, 1)
+
+    return FinalizedStats(
+        n=stats.n,
+        norm_a=norm_a,
+        norm_b=norm_b,
+        diff_norm=diff_norm,
+        relative_diff=relative_diff,
+        cosine_similarity=cosine_similarity,
+        mean_abs_diff=mean_abs_diff,
+        max_abs_diff=stats.max_abs_diff,
+        sign_flip_ratio=sign_flip_ratio,
+        sign_flip_count=stats.sign_flip_count,
+        nan_count_a=stats.nan_count_a,
+        nan_count_b=stats.nan_count_b,
+        nan_count_diff=stats.nan_count_diff,
+        inf_count_a=stats.inf_count_a,
+        inf_count_b=stats.inf_count_b,
+        inf_count_diff=stats.inf_count_diff,
+    )
+
+
+def parameter_group_keys(param_name: str) -> dict[str, str]:
+    """Build reusable grouping keys for multi-level aggregation."""
+    tokens = param_name.split(".")
+    component = tokens[0] if tokens else "unknown"
+    layer = ".".join(tokens[:2]) if len(tokens) >= 2 else component
+    param_type = tokens[-1] if tokens else "unknown"
+
+    return {
+        "global": "__all__",
+        "component": component,
+        "layer": layer,
+        "param_type": param_type,
+        "parameter": param_name,
+    }
+
+
+def compute_hierarchical_stats(
+    pairs: Mapping[str, tuple[torch.Tensor, torch.Tensor]], chunk_size: int = 1_000_000
+) -> dict[str, dict[str, FinalizedStats]]:
+    """Reuse the same raw/finalize pipeline for global/component/layer/type/parameter levels."""
+    accumulators: dict[str, dict[str, RawStats]] = {
+        "global": {},
+        "component": {},
+        "layer": {},
+        "param_type": {},
+        "parameter": {},
+    }
+
+    for param_name, (a_tensor, b_tensor) in pairs.items():
+        raw = compute_raw_stats(a_tensor, b_tensor, chunk_size=chunk_size)
+        for level, group_key in parameter_group_keys(param_name).items():
+            level_map = accumulators[level]
+            if group_key not in level_map:
+                level_map[group_key] = RawStats()
+            level_map[group_key].merge(raw)
+
+    return {
+        level: {group: finalize_stats(raw) for group, raw in grouped.items()}
+        for level, grouped in accumulators.items()
+    }
 
 
 
